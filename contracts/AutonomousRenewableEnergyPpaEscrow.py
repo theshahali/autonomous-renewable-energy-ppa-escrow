@@ -1,6 +1,5 @@
 # AutonomousRenewableEnergyPpaEscrow.py
 # GenLayer Intelligent Contract: Autonomous Renewable Energy PPA Curtailment & Grid Interconnection Escrow
-# Target Account: theshahali (https://github.com/theshahali)
 # Execution Standard: GenLayer Intelligent Contract v0.2.1
 
 import json

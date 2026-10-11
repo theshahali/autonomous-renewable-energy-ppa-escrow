@@ -1,7 +1,6 @@
 # AutonomousRenewableEnergyPpaEscrow
 ### Autonomous Renewable Energy PPA Curtailment & Grid Interconnection Escrow
 **Protocol Standard**: GenLayer Intelligent Contract v0.2.1  
-**Target Account**: [`theshahali`](https://github.com/theshahali)  
 **Repository**: [https://github.com/theshahali/autonomous-renewable-energy-ppa-escrow](https://github.com/theshahali/autonomous-renewable-energy-ppa-escrow)  
 **Execution Environment**: GenLayer Studio Testnet  
 **Contract Address**: [`0xF2D8B2867448dBfE5219c2CAedd53DF7B7E4320e`](https://explorer-studio.genlayer.com/address/0xF2D8B2867448dBfE5219c2CAedd53DF7B7E4320e)  
