@@ -906,7 +906,7 @@ class AutonomousRenewableEnergyPpaEscrow:
 
     @gl.public.view
     def get_claimable_balance(self, account: str) -> u256:
-        clean_acc = self._validate_eth_address(account, "Target Account").lower()
+        clean_acc = self._validate_eth_address(account, "Account").lower()
         return self.claimable_balances.get(clean_acc, u256(0))
 
     @gl.public.view
