@@ -1,0 +1,21 @@
+{
+  "name": "autonomous-renewable-energy-ppa-escrow",
+  "version": "1.0.0",
+  "description": "Autonomous Renewable Energy PPA Curtailment and Grid Interconnection Escrow on GenLayer",
+  "main": "scripts/deploy_renewable_energy_ppa_escrow.mjs",
+  "type": "module",
+  "scripts": {
+    "test": "python test/test_renewable_energy_ppa_escrow.py",
+    "deploy": "node scripts/deploy_renewable_energy_ppa_escrow.mjs"
+  },
+  "keywords": [
+    "genlayer",
+    "intelligent-contracts",
+    "renewable-energy",
+    "ppa-escrow",
+    "grid-curtailment",
+    "deemed-generation"
+  ],
+  "author": "theshahali",
+  "license": "MIT"
+}
