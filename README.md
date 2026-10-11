@@ -4,7 +4,7 @@
 **Target Account**: [`theshahali`](https://github.com/theshahali)  
 **Repository**: [https://github.com/theshahali/autonomous-renewable-energy-ppa-escrow](https://github.com/theshahali/autonomous-renewable-energy-ppa-escrow)  
 **Execution Environment**: GenLayer Studio Testnet  
-**Contract Address**: [`0xB9dE181645eC6712A5A0F05d884EEa67aF00B220`](https://explorer-studio.genlayer.com/address/0xB9dE181645eC6712A5A0F05d884EEa67aF00B220)  
+**Contract Address**: [`0xF2D8B2867448dBfE5219c2CAedd53DF7B7E4320e`](https://explorer-studio.genlayer.com/address/0xF2D8B2867448dBfE5219c2CAedd53DF7B7E4320e)  
 
 ---
 
@@ -21,7 +21,7 @@ Offtakers prepay monthly generation procurement collateral into escrow ($100,000
 ### The GenLayer Intelligent Solution
 `AutonomousRenewableEnergyPpaEscrow` provides an autonomous, verifiable legal-financial bridge on GenLayer:
 - Escrows monthly PPA generation capital backed 100% by payable native funds (`@gl.public.write.payable`).
-- Integrates multi-validator equivalence consensus (`gl.exec_prompt` + `gl.get_webpage`) to ingest official dispatch notices directly from authoritative transmission grid endpoints (`caiso.com`, `ercot.com`, `pjm.com`, `misoenergy.org`, `spp.org`, `ferc.gov`).
+- Integrates multi-validator equivalence consensus (`gl.eq_principle.prompt_non_comparative` + `gl.nondet.web.render`) to ingest official dispatch notices directly from authoritative transmission grid endpoints (`caiso.com`, `ercot.com`, `pjm.com`, `misoenergy.org`, `spp.org`, `ferc.gov`).
 - Employs strict consensus heuristics to classify grid dispatch orders:
   - **CURTAILMENT_CONFIRMED**: Confirms an official ISO Emergency Reliability Curtailment order ($\ge 10$ MWh curtailed) $\rightarrow$ Automatically disburses Deemed Generation indemnity from the escrow to the renewable generator and returns the claimant's dispute bond.
   - **CLAIM_REFUTED**: Frivolous or maintenance-caused claim $\rightarrow$ Slashes claim bond to the offtaker's indemnity reserve balance.
@@ -73,7 +73,7 @@ Offtakers prepay monthly generation procurement collateral into escrow ($100,000
               v                                                 v
    +----------------------+                        +-----------------------------+
    | STATE: FULFILLED     |                        | Multi-Validator LLM Consens |
-   |                      |                        | (gl.get_webpage + AI audit) |
+   |                      |                        | (gl.eq_principle + nondet)  |
    +----------------------+                        +-----------------------------+
                                                                 |
                                               +------------------+------------------+

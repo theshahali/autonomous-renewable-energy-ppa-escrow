@@ -7,22 +7,14 @@ import re
 from datetime import datetime, timezone
 
 
-class MockGL:
-    def __init__(self):
-        self.transfers = []
-        self.mock_web_responses = {}
-        self.fail_web_fetch = False
-        self.simulate_transfer_fail = False
+class MockWeb:
+    def __init__(self, gl):
+        self.gl = gl
 
-    def emit_transfer(self, recipient: str, amount: int):
-        if self.simulate_transfer_fail:
-            raise RuntimeError("Simulated EVM transfer failure")
-        self.transfers.append({"recipient": str(recipient).lower(), "amount": int(amount)})
-
-    def get_webpage(self, url: str) -> str:
-        if self.fail_web_fetch:
+    def render(self, url: str, mode: str = "text") -> str:
+        if self.gl.fail_web_fetch:
             raise RuntimeError("Simulated network timeout connecting to ISO market portal")
-        return self.mock_web_responses.get(
+        return self.gl.mock_web_responses.get(
             url,
             "<html><body><h1>CAISO Transmission Emergency Operating Order: DISP-2026-994</h1>"
             "<p>Node: MIDWAY-SUB-500KV. Substation Emergency Transmission Line Congestion. "
@@ -30,13 +22,46 @@ class MockGL:
             "Total Curtailed Energy: 450 MWh. Reliability Must-Run event confirmed. Cause: Intertie overload, not generator maintenance.</p></body></html>"
         )
 
-    def exec_prompt(self, prompt: str) -> str:
-        return json.dumps({
-            "curtailment_confirmed": True,
+
+class MockNondet:
+    def __init__(self, gl):
+        self.web = MockWeb(gl)
+
+
+class MockEqPrinciple:
+    def __init__(self, gl):
+        self.gl = gl
+
+    def prompt_non_comparative(self, get_input_fn, task="", criteria=""):
+        input_data = get_input_fn()
+        if self.gl.corrupt_llm_json:
+            return "This is a corrupted non-JSON LLM response that would normally cause JSONDecodeError."
+        return self.gl.consensus_return_value
+
+
+class MockGL:
+    def __init__(self):
+        self.transfers = []
+        self.mock_web_responses = {}
+        self.fail_web_fetch = False
+        self.simulate_transfer_fail = False
+        self.corrupt_llm_json = False
+        self.nondet = MockNondet(self)
+        self.eq_principle = MockEqPrinciple(self)
+        self.consensus_return_value = json.dumps({
+            "node_matched": True,
+            "mandatory_iso_curtailment": True,
             "verified_curtailed_mwh": 450,
+            "curtailment_confirmed": True,
             "confidence_score": 96,
+            "verdict": "CURTAILMENT_CONFIRMED",
             "rationale": "CAISO emergency transmission congestion mandatory curtailment order confirmed for 450 MWh."
         })
+
+    def emit_transfer(self, recipient: str, amount: int):
+        if self.simulate_transfer_fail:
+            raise RuntimeError("Simulated EVM transfer failure")
+        self.transfers.append({"recipient": str(recipient).lower(), "amount": int(amount)})
 
 
 class MockAutonomousRenewableEnergyPpaEscrow:
@@ -348,18 +373,45 @@ class MockAutonomousRenewableEnergyPpaEscrow:
 
         e = self.escrows[clm["escrow_id"]]
 
-        try:
-            dispatch_text = self.gl.get_webpage(clm["dispatch_order_url"])
-        except Exception:
-            raise AssertionError("[ERR_EVIDENCE_FETCH_FAILED] Consensus could not fetch dispatch order.")
+        dispatch_url = clm["dispatch_order_url"]
+        facility_node_val = e["facility_node"]
+        contracted_capacity_val = str(e["contracted_capacity_mw"])
+        claimed_mwh_val = str(clm["curtailed_mwh"])
 
-        assert dispatch_text is not None and len(dispatch_text.strip()) >= 30, "[ERR_EVIDENCE_FETCH_FAILED] Dispatch response too short."
+        def get_input() -> str:
+            try:
+                raw_data = self.gl.nondet.web.render(dispatch_url, mode="text")
+            except Exception:
+                raise AssertionError("[ERR_EVIDENCE_FETCH_FAILED] Consensus could not fetch dispatch order from " + dispatch_url)
+            assert raw_data is not None and len(raw_data.strip()) >= 30, \
+                "[ERR_EVIDENCE_FETCH_FAILED] Dispatch response too short."
+            cleaned = re.sub(r'<[^>]+>', ' ', raw_data)
+            return f"Node: {facility_node_val}\nCapacity: {contracted_capacity_val}\nClaimed MWh: {claimed_mwh_val}\n\n{cleaned}"
 
-        # HTML sanitization (HIGH-02)
-        cleaned_text = re.sub(r'<script[^>]*>.*?</script>', ' ', dispatch_text, flags=re.DOTALL | re.IGNORECASE)
-        cleaned_text = re.sub(r'<style[^>]*>.*?</style>', ' ', cleaned_text, flags=re.DOTALL | re.IGNORECASE)
-        cleaned_text = re.sub(r'<[^>]+>', ' ', cleaned_text)
-        cleaned_text = ' '.join(cleaned_text.split())
+        task = "Auditor Task: Analyze power grid dispatch order."
+        criteria = "Auditor Criteria: Independently verify curtailment orders."
+
+        if simulate_parse_error:
+            self.gl.corrupt_llm_json = True
+        elif custom_curt is not None and custom_mwh is not None:
+            self.gl.corrupt_llm_json = False
+            self.gl.consensus_return_value = json.dumps({
+                "node_matched": True,
+                "mandatory_iso_curtailment": custom_curt,
+                "verified_curtailed_mwh": custom_mwh,
+                "curtailment_confirmed": custom_curt,
+                "confidence_score": custom_conf if custom_conf is not None else 85,
+                "verdict": "CURTAILMENT_CONFIRMED" if custom_curt else "CLAIM_REFUTED",
+                "rationale": "Test curtailment adjudication verdict."
+            })
+        else:
+            self.gl.corrupt_llm_json = False
+
+        consensus_result = self.gl.eq_principle.prompt_non_comparative(
+            get_input,
+            task=task,
+            criteria=criteria
+        )
 
         parse_valid = False
         parsed_curt = False
@@ -367,37 +419,20 @@ class MockAutonomousRenewableEnergyPpaEscrow:
         confidence = 0
         rationale = "Consensus fallback resolution."
 
-        if simulate_parse_error:
-            parse_valid = False
-        elif custom_curt is not None and custom_mwh is not None:
-            raw_resp = json.dumps({
-                "curtailment_confirmed": custom_curt,
-                "verified_curtailed_mwh": custom_mwh,
-                "confidence_score": custom_conf if custom_conf is not None else 85,
-                "rationale": "Test curtailment adjudication verdict."
-            })
-            parsed = json.loads(raw_resp)
+        try:
+            clean_json = consensus_result.strip()
+            if "```json" in clean_json:
+                clean_json = clean_json.split("```json")[1].split("```")[0].strip()
+            elif "```" in clean_json:
+                clean_json = clean_json.split("```")[1].split("```")[0].strip()
+            parsed = json.loads(clean_json)
             parsed_curt = bool(parsed.get("curtailment_confirmed", False))
             parsed_mwh = int(parsed.get("verified_curtailed_mwh", 0))
             confidence = int(parsed.get("confidence_score", 0))
             rationale = parsed.get("rationale", "")
             parse_valid = True
-        else:
-            raw_resp = self.gl.exec_prompt("Prompt")
-            try:
-                clean_json = raw_resp.strip()
-                if "```json" in clean_json:
-                    clean_json = clean_json.split("```json")[1].split("```")[0].strip()
-                elif "```" in clean_json:
-                    clean_json = clean_json.split("```")[1].split("```")[0].strip()
-                parsed = json.loads(clean_json)
-                parsed_curt = bool(parsed.get("curtailment_confirmed", False))
-                parsed_mwh = int(parsed.get("verified_curtailed_mwh", 0))
-                confidence = int(parsed.get("confidence_score", 0))
-                rationale = parsed.get("rationale", "")
-                parse_valid = True
-            except Exception:
-                parse_valid = False
+        except Exception:
+            parse_valid = False
 
         # CRIT-01 Safe Inconclusive Fallback & HIGH-02 Confidence Weighting
         if parse_valid and parsed_curt and parsed_mwh >= self.MIN_CURTAILED_MWH and confidence >= 70:
