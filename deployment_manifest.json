@@ -1,12 +1,12 @@
 {
   "contractName": "AutonomousRenewableEnergyPpaEscrow",
-  "contractAddress": "0x5E24d4CF6Dc0da8128E0bc0f3369B1009f6FE66F",
-  "transactionHash": "0x7c922e83ac55b978b1828d62d41edc1576661b279827118c4618f885f7bf34a5",
-  "deployerAddress": "0x70dEE5a641D05F7B00dEec1eee6489693bf8B30b",
+  "contractAddress": "0xB9dE181645eC6712A5A0F05d884EEa67aF00B220",
+  "transactionHash": "0xfacb54e706dce3d077a9cb7dd2311f33f71d61a6117e5e41032743f09a7ef078",
+  "deployerAddress": "0xf2eeCAF251A62F12B52E306cb675C062c5e1CE4a",
   "network": "GenLayer Studio Testnet",
   "rpcEndpoint": "https://studio.genlayer.com/api",
-  "explorerUrl": "https://explorer-studio.genlayer.com/address/0x5E24d4CF6Dc0da8128E0bc0f3369B1009f6FE66F",
-  "deployedAt": "2026-10-11T18:02:32.713Z",
+  "explorerUrl": "https://explorer-studio.genlayer.com/address/0xB9dE181645eC6712A5A0F05d884EEa67aF00B220",
+  "deployedAt": "2026-10-11T19:35:58.441Z",
   "initialState": {
     "totalEscrowsCreated": 0,
     "totalVolumeLockedWei": "0",

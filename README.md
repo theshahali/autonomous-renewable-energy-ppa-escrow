@@ -4,7 +4,7 @@
 **Target Account**: [`theshahali`](https://github.com/theshahali)  
 **Repository**: [https://github.com/theshahali/autonomous-renewable-energy-ppa-escrow](https://github.com/theshahali/autonomous-renewable-energy-ppa-escrow)  
 **Execution Environment**: GenLayer Studio Testnet  
-**Contract Address**: [`0x5E24d4CF6Dc0da8128E0bc0f3369B1009f6FE66F`](https://explorer-studio.genlayer.com/address/0x5E24d4CF6Dc0da8128E0bc0f3369B1009f6FE66F)  
+**Contract Address**: [`0xB9dE181645eC6712A5A0F05d884EEa67aF00B220`](https://explorer-studio.genlayer.com/address/0xB9dE181645eC6712A5A0F05d884EEa67aF00B220)  
 
 ---
 

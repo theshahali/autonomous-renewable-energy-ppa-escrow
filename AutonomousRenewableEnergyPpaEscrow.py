@@ -34,6 +34,7 @@ MIN_CLAIM_BOND = 25_000_000_000            # 25 Gwei minimum dispute bond
 MIN_PPA_DURATION = 86400 * 7               # 7 days minimum billing cycle
 MAX_PPA_DURATION = 86400 * 365 * 5         # 5 years maximum long-term contract
 CLAIM_TIMEOUT_SECONDS = 86400 * 7          # 7 days unreachability recovery timeout
+IDLE_EXPIRY_GRACE_PERIOD = 86400 * 2       # 2 days generator priority claim window before idle recovery
 MIN_CURTAILED_MWH = 10                     # 10 MWh minimum threshold for compensable curtailment
 
 # Approved Grid Operators & Transmission ISO Domains (SSRF Defense Whitelist)
@@ -209,6 +210,8 @@ class AutonomousRenewableEnergyPpaEscrow:
         assert offtaker_hex != generator_hex, "[ERR_IDENTICAL_PARTIES] Offtaker and generator cannot be the same address."
 
         clean_node = self._sanitize_string(facility_node, 4, 64, "Facility Interconnection Node")
+        assert re.match(r'^[a-zA-Z0-9_\-\. ]{4,64}$', clean_node), \
+            "[ERR_INVALID_NODE_ID] Facility interconnection node must only contain alphanumeric characters, spaces, underscores, hyphens, and periods."
         clean_capacity_mw = int(contracted_capacity_mw)
         assert clean_capacity_mw > 0 and clean_capacity_mw <= 10000, "[ERR_INVALID_CAPACITY] Capacity must be between 1 and 10,000 MW."
 
@@ -327,13 +330,68 @@ class AutonomousRenewableEnergyPpaEscrow:
         )
 
     # --------------------------------------------------------------------------
-    # Core Function 5: Claim Expired Undelivered Escrow
+    # Core Function 5: Claim Completed PPA Payout (Symmetric Generator Right - CRIT-01 Remediated)
+    # --------------------------------------------------------------------------
+    @gl.public.write
+    def claim_completed_ppa_payout(self, escrow_id: str) -> str:
+        """
+        Allows the renewable generator (or offtaker / owner) to disburse generation collateral
+        to the renewable generator once the billing deadline has elapsed without an active dispute.
+        Guarantees symmetric economic rights for renewable power generators (CRIT-01 Remediated).
+        """
+        clean_e_id = escrow_id.strip().upper()
+        assert clean_e_id in self.escrows, "[ERR_ESCROW_NOT_FOUND] Target PPA escrow record not found."
+        escrow = self.escrows[clean_e_id]
+        assert escrow.status == STATUS_ACTIVE, \
+            "[ERR_ESCROW_NOT_ACTIVE] Escrow must be in ACTIVE status (cannot claim payout while DISPUTED or terminal)."
+
+        sender_hex = self._validate_eth_address(str(gl.message.sender), "Caller").lower()
+        owner_hex = self._validate_eth_address(str(self.owner), "Owner").lower()
+        assert sender_hex in (escrow.generator, escrow.offtaker, owner_hex), \
+            "[ERR_UNAUTHORIZED] Only generator, offtaker, or owner can trigger completed PPA payout."
+
+        now_utc = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        assert now_utc > int(escrow.billing_deadline), \
+            "[ERR_DEADLINE_NOT_REACHED] PPA billing deadline has not yet elapsed."
+
+        amt = int(escrow.ppa_collateral)
+        assert amt > 0, "[ERR_ZERO_COLLATERAL] No collateral remaining to disburse."
+
+        escrow.status = STATUS_FULFILLED
+        escrow.total_released_to_generator += u256(amt)
+        escrow.ppa_collateral = u256(0)
+        self.escrows[clean_e_id] = escrow
+        self.total_collateral_released += u256(amt)
+
+        transfer_succeeded = False
+        try:
+            gl.emit_transfer(Address(escrow.generator), u256(amt))
+            transfer_succeeded = True
+        except Exception:
+            transfer_succeeded = False
+
+        if transfer_succeeded:
+            if int(self.total_volume_locked) >= amt:
+                self.total_volume_locked -= u256(amt)
+            else:
+                self.total_volume_locked = u256(0)
+        else:
+            cur = int(self.claimable_balances.get(escrow.generator, u256(0)))
+            self.claimable_balances[escrow.generator] = u256(cur + amt)
+
+        return (
+            "PPA_PAYOUT_CLAIMED: " + clean_e_id + " | Disbursed: " + str(amt)
+            + " wei to Generator " + escrow.generator
+        )
+
+    # --------------------------------------------------------------------------
+    # Core Function 5b: Claim Expired Undelivered Escrow (Offtaker Recovery after Grace Window)
     # --------------------------------------------------------------------------
     @gl.public.write
     def claim_expired_undelivered_escrow(self, escrow_id: str) -> str:
         """
         Allows the offtaker to reclaim unfulfilled collateral if the billing deadline has elapsed
-        without delivery or active dispute.
+        plus the 2-day generator priority window without delivery or active dispute.
         Prevents settlement if escrow is currently disputed (HIGH-01 Remediated).
         """
         clean_e_id = escrow_id.strip().upper()
@@ -343,12 +401,13 @@ class AutonomousRenewableEnergyPpaEscrow:
             "[ERR_ESCROW_NOT_ACTIVE] Escrow must be in ACTIVE status (cannot reclaim while DISPUTED or terminal)."
 
         sender_hex = self._validate_eth_address(str(gl.message.sender), "Caller").lower()
-        assert sender_hex == escrow.offtaker, \
-            "[ERR_UNAUTHORIZED] Only the offtaker can reclaim expired PPA collateral."
+        owner_hex = self._validate_eth_address(str(self.owner), "Owner").lower()
+        assert sender_hex in (escrow.offtaker, owner_hex), \
+            "[ERR_UNAUTHORIZED] Only the offtaker (or contract owner) can reclaim expired PPA collateral."
 
         now_utc = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-        assert now_utc > int(escrow.billing_deadline), \
-            "[ERR_DEADLINE_NOT_REACHED] PPA billing deadline has not yet elapsed."
+        assert now_utc > int(escrow.billing_deadline) + IDLE_EXPIRY_GRACE_PERIOD, \
+            "[ERR_DEADLINE_NOT_REACHED] Must wait until PPA billing deadline plus 2-day generator claim window elapses."
 
         amt = int(escrow.ppa_collateral)
         assert amt > 0, "[ERR_ZERO_COLLATERAL] No collateral remaining to refund."
@@ -407,6 +466,9 @@ class AutonomousRenewableEnergyPpaEscrow:
             "[ERR_DEADLINE_ELAPSED] PPA billing deadline has already elapsed."
 
         sender_hex = self._validate_eth_address(str(gl.message.sender), "Claimant").lower()
+        owner_hex = self._validate_eth_address(str(self.owner), "Owner").lower()
+        assert sender_hex in (escrow.generator, owner_hex), \
+            "[ERR_UNAUTHORIZED_CLAIMANT] Only the renewable generator (or contract owner) can submit a curtailment indemnity claim."
         clean_url = self._validate_dispatch_url(dispatch_order_url)
         clean_nonce = self._sanitize_string(nonce, 1, 64, "Nonce")
 
@@ -525,6 +587,10 @@ class AutonomousRenewableEnergyPpaEscrow:
             elif "```" in clean_json:
                 clean_json = clean_json.split("```")[1].split("```")[0].strip()
 
+            match = re.search(r'\{[^{}]*\}', clean_json, re.DOTALL)
+            if match:
+                clean_json = match.group(0)
+
             parsed = json.loads(clean_json)
             parsed_curtailment = bool(parsed.get("curtailment_confirmed", False))
             raw_mwh = parsed.get("verified_curtailed_mwh", 0)
@@ -537,13 +603,13 @@ class AutonomousRenewableEnergyPpaEscrow:
         except Exception:
             parse_valid = False
 
-        # Strict Metric Binding (CRIT-01 Remediated: Safe Inconclusive Fallback)
+        # Strict Metric Binding (HIGH-02 Remediated: Confidence-Weighted Classification)
         if parse_valid and parsed_curtailment and parsed_mwh >= MIN_CURTAILED_MWH and confidence >= 70:
             final_verdict = CLAIM_CURTAILMENT_CONFIRMED
-        elif parse_valid and (not parsed_curtailment or parsed_mwh < MIN_CURTAILED_MWH or confidence < 30):
+        elif parse_valid and confidence >= 70 and (not parsed_curtailment or parsed_mwh < MIN_CURTAILED_MWH):
             final_verdict = CLAIM_REFUTED
         else:
-            final_verdict = CLAIM_INCONCLUSIVE  # Safe fallback preserves claimant bond!
+            final_verdict = CLAIM_INCONCLUSIVE  # Safe fallback preserves claimant bond on low confidence (< 70) or parse anomaly!
 
         now_utc = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
         clm.adjudicated_at = u256(now_utc)
@@ -613,6 +679,11 @@ class AutonomousRenewableEnergyPpaEscrow:
             # Unlock escrow back to ACTIVE
             escrow.status = STATUS_ACTIVE
 
+            # Reset order record so claimant can re-file if conclusive dispatch data is published later (MED-01 Remediated)
+            order_key = clm.escrow_id + "::" + clm.dispatch_order_url.lower()
+            if order_key in self.consumed_escrow_orders:
+                self.consumed_escrow_orders[order_key] = False
+
             transfer_claimant = False
             try:
                 gl.emit_transfer(Address(clm.claimant), u256(bond_val))
@@ -636,20 +707,26 @@ class AutonomousRenewableEnergyPpaEscrow:
         return "CLAIM_ADJUDICATED: " + clean_c_id + " | Verdict: " + final_verdict
 
     # --------------------------------------------------------------------------
-    # Core Function 8: 7-Day Timeout Curtailment Bond Safeguard
+    # Core Function 8: 7-Day Timeout Curtailment Bond Safeguard (CRIT-02 Remediated)
     # --------------------------------------------------------------------------
     @gl.public.write
     def claim_abandoned_curtailment_bond(self, claim_id: str) -> str:
         """
-        Allows claimant to recover their bond if ISO dispatch endpoints remain
-        unreachable for 7 days after filing. Unlocks escrow upon abandonment.
+        Allows claimant, offtaker, generator, or owner to resolve the abandoned claim and recover the bond
+        if ISO dispatch endpoints remain unreachable for 7 days after filing.
+        Unlocks escrow upon abandonment (CRIT-02 Remediated).
         """
         clean_c_id = claim_id.strip().upper()
         assert clean_c_id in self.claims, "[ERR_CLAIM_NOT_FOUND] Target claim does not exist."
         clm = self.claims[clean_c_id]
 
         sender_hex = self._validate_eth_address(str(gl.message.sender), "Caller").lower()
-        assert sender_hex == clm.claimant, "[ERR_UNAUTHORIZED] Only claimant can recover bond."
+        owner_hex = self._validate_eth_address(str(self.owner), "Owner").lower()
+        assert clm.escrow_id in self.escrows, "[ERR_ESCROW_NOT_FOUND] Escrow record not found."
+        escrow = self.escrows[clm.escrow_id]
+
+        assert sender_hex in (clm.claimant, escrow.offtaker, escrow.generator, owner_hex), \
+            "[ERR_UNAUTHORIZED] Only claimant, offtaker, generator, or owner can resolve abandoned claim."
         assert clm.verdict == CLAIM_PENDING, "[ERR_CLAIM_NOT_PENDING] Claim is not pending adjudication."
 
         now_utc = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
@@ -662,16 +739,19 @@ class AutonomousRenewableEnergyPpaEscrow:
         clm.adjudication_rationale = "Recovered after 7-day ISO dispatch ingestion timeout."
         self.claims[clean_c_id] = clm
 
+        # Reset consumed order record so it can be re-filed if dispatch data updates (MED-01 Remediated)
+        order_key = clm.escrow_id + "::" + clm.dispatch_order_url.lower()
+        if order_key in self.consumed_escrow_orders:
+            self.consumed_escrow_orders[order_key] = False
+
         # Unlock escrow back to ACTIVE
-        if clm.escrow_id in self.escrows:
-            e = self.escrows[clm.escrow_id]
-            if e.status == STATUS_DISPUTED:
-                e.status = STATUS_ACTIVE
-                self.escrows[clm.escrow_id] = e
+        if escrow.status == STATUS_DISPUTED:
+            escrow.status = STATUS_ACTIVE
+            self.escrows[clm.escrow_id] = escrow
 
         transfer_succeeded = False
         try:
-            gl.emit_transfer(Address(sender_hex), u256(bond_val))
+            gl.emit_transfer(Address(clm.claimant), u256(bond_val))
             transfer_succeeded = True
         except Exception:
             transfer_succeeded = False
@@ -682,8 +762,8 @@ class AutonomousRenewableEnergyPpaEscrow:
             else:
                 self.total_volume_locked = u256(0)
         else:
-            cur = int(self.claimable_balances.get(sender_hex, u256(0)))
-            self.claimable_balances[sender_hex] = u256(cur + bond_val)
+            cur = int(self.claimable_balances.get(clm.claimant, u256(0)))
+            self.claimable_balances[clm.claimant] = u256(cur + bond_val)
 
         return "BOND_RECLAIMED: " + clean_c_id + " | Amount: " + str(bond_val) + " wei"
 

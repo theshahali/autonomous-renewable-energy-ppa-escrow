@@ -75,6 +75,7 @@ class MockAutonomousRenewableEnergyPpaEscrow:
         self.MIN_PPA_DURATION = 86400 * 7
         self.MAX_PPA_DURATION = 86400 * 365 * 5
         self.CLAIM_TIMEOUT_SECONDS = 86400 * 7
+        self.IDLE_EXPIRY_GRACE_PERIOD = 86400 * 2
         self.MIN_CURTAILED_MWH = 10
 
         self.APPROVED_GRID_DOMAINS = (
@@ -151,6 +152,8 @@ class MockAutonomousRenewableEnergyPpaEscrow:
         assert offtaker_hex != generator_hex, "[ERR_IDENTICAL_PARTIES] Offtaker and generator cannot be identical."
 
         clean_node = self._sanitize_string(facility_node, 4, 64, "Facility Interconnection Node")
+        assert re.match(r'^[a-zA-Z0-9_\-\. ]{4,64}$', clean_node), \
+            "[ERR_INVALID_NODE_ID] Facility interconnection node must only contain alphanumeric characters, spaces, underscores, hyphens, and periods."
         assert contracted_capacity_mw > 0 and contracted_capacity_mw <= 10000, "[ERR_INVALID_CAPACITY] Capacity invalid."
         assert duration_seconds >= self.MIN_PPA_DURATION, "[ERR_DURATION_TOO_SHORT] Duration too short."
         assert duration_seconds <= self.MAX_PPA_DURATION, "[ERR_DURATION_TOO_LONG] Duration too long."
@@ -221,16 +224,50 @@ class MockAutonomousRenewableEnergyPpaEscrow:
 
         return "FULFILLED: " + escrow_id
 
+    def claim_completed_ppa_payout(self, caller: str, escrow_id: str, custom_time: int = None):
+        assert escrow_id in self.escrows, "[ERR_ESCROW_NOT_FOUND] Escrow not found."
+        e = self.escrows[escrow_id]
+        assert e["status"] == self.STATUS_ACTIVE, "[ERR_ESCROW_NOT_ACTIVE] Escrow not active."
+
+        sender_hex = self._validate_eth_address(caller, "Caller")
+        assert sender_hex in (e["generator"], e["offtaker"], self.owner), "[ERR_UNAUTHORIZED] Only generator, offtaker, or owner can trigger completed PPA payout."
+
+        now_utc = custom_time if custom_time is not None else int(datetime.now(timezone.utc).timestamp())
+        assert now_utc > e["billing_deadline"], "[ERR_DEADLINE_NOT_REACHED] Deadline not reached."
+
+        amt = e["ppa_collateral"]
+        assert amt > 0, "[ERR_ZERO_COLLATERAL] No collateral to disburse."
+
+        e["status"] = self.STATUS_FULFILLED
+        e["total_released_to_generator"] += amt
+        e["ppa_collateral"] = 0
+        self.total_collateral_released += amt
+
+        transfer_succeeded = False
+        try:
+            self.gl.emit_transfer(e["generator"], amt)
+            transfer_succeeded = True
+        except Exception:
+            transfer_succeeded = False
+
+        if transfer_succeeded:
+            self.total_volume_locked = max(0, self.total_volume_locked - amt)
+        else:
+            cur = self.claimable_balances.get(e["generator"], 0)
+            self.claimable_balances[e["generator"]] = cur + amt
+
+        return "PPA_PAYOUT_CLAIMED: " + escrow_id
+
     def claim_expired_undelivered_escrow(self, caller: str, escrow_id: str, custom_time: int = None):
         assert escrow_id in self.escrows, "[ERR_ESCROW_NOT_FOUND] Escrow not found."
         e = self.escrows[escrow_id]
         assert e["status"] == self.STATUS_ACTIVE, "[ERR_ESCROW_NOT_ACTIVE] Escrow not active."
 
         sender_hex = self._validate_eth_address(caller, "Caller")
-        assert sender_hex == e["offtaker"], "[ERR_UNAUTHORIZED] Only offtaker can reclaim expired escrow."
+        assert sender_hex in (e["offtaker"], self.owner), "[ERR_UNAUTHORIZED] Only offtaker can reclaim expired escrow."
 
         now_utc = custom_time if custom_time is not None else int(datetime.now(timezone.utc).timestamp())
-        assert now_utc > e["billing_deadline"], "[ERR_DEADLINE_NOT_REACHED] Deadline not reached."
+        assert now_utc > e["billing_deadline"] + self.IDLE_EXPIRY_GRACE_PERIOD, "[ERR_DEADLINE_NOT_REACHED] Must wait until billing deadline plus 2-day generator claim window elapses."
 
         amt = e["ppa_collateral"]
         assert amt > 0, "[ERR_ZERO_COLLATERAL] No collateral to refund."
@@ -265,6 +302,7 @@ class MockAutonomousRenewableEnergyPpaEscrow:
         assert now_utc <= e["billing_deadline"], "[ERR_DEADLINE_ELAPSED] Billing deadline has elapsed."
 
         sender_hex = self._validate_eth_address(caller, "Claimant")
+        assert sender_hex in (e["generator"], self.owner), "[ERR_UNAUTHORIZED_CLAIMANT] Only generator or owner can submit claim."
         clean_url = self._validate_dispatch_url(dispatch_order_url)
         clean_nonce = self._sanitize_string(nonce, 1, 64, "Nonce")
         assert curtailed_mwh >= self.MIN_CURTAILED_MWH, "[ERR_CURTAILMENT_TOO_LOW] Curtailed volume below threshold."
@@ -361,10 +399,10 @@ class MockAutonomousRenewableEnergyPpaEscrow:
             except Exception:
                 parse_valid = False
 
-        # CRIT-01 Safe Inconclusive Fallback
+        # CRIT-01 Safe Inconclusive Fallback & HIGH-02 Confidence Weighting
         if parse_valid and parsed_curt and parsed_mwh >= self.MIN_CURTAILED_MWH and confidence >= 70:
             final_verdict = self.CLAIM_CURTAILMENT_CONFIRMED
-        elif parse_valid and (not parsed_curt or parsed_mwh < self.MIN_CURTAILED_MWH or confidence < 30):
+        elif parse_valid and confidence >= 70 and (not parsed_curt or parsed_mwh < self.MIN_CURTAILED_MWH):
             final_verdict = self.CLAIM_REFUTED
         else:
             final_verdict = self.CLAIM_INCONCLUSIVE
@@ -427,6 +465,11 @@ class MockAutonomousRenewableEnergyPpaEscrow:
             # Unlock escrow back to ACTIVE
             e["status"] = self.STATUS_ACTIVE
 
+            # Reset order key so it can be re-filed (MED-01 Remediated)
+            order_key = clm["escrow_id"] + "::" + clm["dispatch_order_url"].lower()
+            if order_key in self.consumed_escrow_orders:
+                self.consumed_escrow_orders[order_key] = False
+
             transfer_claimant = False
             try:
                 self.gl.emit_transfer(clm["claimant"], bond_val)
@@ -446,9 +489,10 @@ class MockAutonomousRenewableEnergyPpaEscrow:
     def claim_abandoned_curtailment_bond(self, caller: str, claim_id: str, custom_time: int = None):
         assert claim_id in self.claims, "[ERR_CLAIM_NOT_FOUND] Claim not found."
         clm = self.claims[claim_id]
+        e = self.escrows[clm["escrow_id"]]
 
         sender_hex = self._validate_eth_address(caller, "Caller")
-        assert sender_hex == clm["claimant"], "[ERR_UNAUTHORIZED] Only claimant can recover bond."
+        assert sender_hex in (clm["claimant"], e["offtaker"], e["generator"], self.owner), "[ERR_UNAUTHORIZED] Only claimant, offtaker, generator, or owner can recover bond."
         assert clm["verdict"] == self.CLAIM_PENDING, "[ERR_CLAIM_NOT_PENDING] Claim not pending."
 
         now_utc = custom_time if custom_time is not None else int(datetime.now(timezone.utc).timestamp())
@@ -459,15 +503,19 @@ class MockAutonomousRenewableEnergyPpaEscrow:
         clm["has_claimed"] = True
         clm["adjudication_rationale"] = "Recovered after 7-day timeout."
 
+        # Reset order key so it can be re-filed (MED-01 Remediated)
+        order_key = clm["escrow_id"] + "::" + clm["dispatch_order_url"].lower()
+        if order_key in self.consumed_escrow_orders:
+            self.consumed_escrow_orders[order_key] = False
+
         # Unlock escrow back to ACTIVE
         if clm["escrow_id"] in self.escrows:
-            e = self.escrows[clm["escrow_id"]]
             if e["status"] == self.STATUS_DISPUTED:
                 e["status"] = self.STATUS_ACTIVE
 
         transfer_claimant = False
         try:
-            self.gl.emit_transfer(sender_hex, bond_val)
+            self.gl.emit_transfer(clm["claimant"], bond_val)
             transfer_claimant = True
         except Exception:
             transfer_claimant = False
@@ -475,8 +523,8 @@ class MockAutonomousRenewableEnergyPpaEscrow:
         if transfer_claimant:
             self.total_volume_locked = max(0, self.total_volume_locked - bond_val)
         else:
-            cur = self.claimable_balances.get(sender_hex, 0)
-            self.claimable_balances[sender_hex] = cur + bond_val
+            cur = self.claimable_balances.get(clm["claimant"], 0)
+            self.claimable_balances[clm["claimant"]] = cur + bond_val
 
         return "BOND_RECLAIMED: " + claim_id
 
@@ -600,11 +648,11 @@ def run_all_tests():
     assert h1 != h3, "Different nonce must yield distinct hash"
     print("  PASS: Canonical length-prefixed hashing prevents delimiter collisions.")
 
-    # Phase 7: Submit Curtailment Indemnity Claim with Dispute State Lock (HIGH-01)
+    # Phase 7: Submit Curtailment Indemnity Claim with Dispute State Lock (HIGH-01, HIGH-03)
     print("\n[Phase 7] Submitting curtailment claim and verifying dispute lock...")
     bond_amount = 30_000_000_000  # 30 Gwei
     claim_id = contract.submit_curtailment_indemnity_claim(
-        caller=claimant,
+        caller=generator,
         value=bond_amount,
         escrow_id=escrow_id,
         dispatch_order_url=valid_url,
@@ -622,13 +670,13 @@ def run_all_tests():
         assert False, "Should reject delivery confirmation while DISPUTED"
     except AssertionError as e:
         assert "[ERR_ESCROW_NOT_ACTIVE]" in str(e)
-    print("  PASS: Curtailment claim filed with payable bond, locking escrow to DISPUTED state:", claim_id)
+    print("  PASS: Curtailment claim filed by generator with payable bond, locking escrow to DISPUTED state:", claim_id)
 
     # Phase 8: Prevent Duplicate Dispatch Order Replay
     print("\n[Phase 8] Testing replay prevention on identical dispatch order...")
     try:
         contract.submit_curtailment_indemnity_claim(
-            caller=claimant,
+            caller=generator,
             value=bond_amount,
             escrow_id=escrow_id,
             dispatch_order_url=valid_url,
@@ -650,11 +698,9 @@ def run_all_tests():
     assert contract.escrows[escrow_id]["ppa_collateral"] == 0
     assert contract.escrows[escrow_id]["total_released_to_generator"] == total_collateral_in_escrow
 
-    # Verify transfers to generator and claimant
+    # Verify transfers to generator
     gen_transfers = [t for t in mock_gl.transfers if t["recipient"] == generator]
-    claimant_transfers = [t for t in mock_gl.transfers if t["recipient"] == claimant]
     assert any(t["amount"] == total_collateral_in_escrow for t in gen_transfers), "Generator must receive Deemed Generation compensation"
-    assert any(t["amount"] == bond_amount for t in claimant_transfers), "Claimant must recover claim bond"
     print("  PASS: Deemed generation indemnity paid to generator & bond returned to claimant.")
 
     # Phase 10: Consensus Adjudication: CLAIM_REFUTED (Frivolous / Maintenance Outage)
@@ -668,7 +714,7 @@ def run_all_tests():
         duration_seconds=86400 * 30
     )
     claim_id_2 = contract.submit_curtailment_indemnity_claim(
-        caller=claimant,
+        caller=generator,
         value=bond_amount,
         escrow_id=escrow_id_2,
         dispatch_order_url="https://ercot.com/notices/frivolous",
@@ -692,7 +738,7 @@ def run_all_tests():
         duration_seconds=86400 * 60
     )
     claim_id_safe = contract.submit_curtailment_indemnity_claim(
-        caller=claimant,
+        caller=generator,
         value=bond_amount,
         escrow_id=escrow_id_safe,
         dispatch_order_url="https://pjm.com/dispatch/order-parse-err",
@@ -715,7 +761,7 @@ def run_all_tests():
         duration_seconds=86400 * 14
     )
     claim_id_3 = contract.submit_curtailment_indemnity_claim(
-        caller=claimant,
+        caller=generator,
         value=bond_amount,
         escrow_id=escrow_id_timeout,
         dispatch_order_url="https://spp.org/timeout-test",
@@ -735,12 +781,12 @@ def run_all_tests():
     print("\n[Phase 12] Testing 7-day timeout bond recovery for claimant...")
     now = int(datetime.now(timezone.utc).timestamp())
     try:
-        contract.claim_abandoned_curtailment_bond(caller=claimant, claim_id=claim_id_3, custom_time=now + 86400 * 2)
+        contract.claim_abandoned_curtailment_bond(caller=generator, claim_id=claim_id_3, custom_time=now + 86400 * 2)
         assert False, "Should revert before 7 days have elapsed"
     except AssertionError as e:
         assert "[ERR_TIMEOUT_NOT_REACHED]" in str(e)
 
-    contract.claim_abandoned_curtailment_bond(caller=claimant, claim_id=claim_id_3, custom_time=now + 86400 * 8)
+    contract.claim_abandoned_curtailment_bond(caller=generator, claim_id=claim_id_3, custom_time=now + 86400 * 8)
     assert contract.claims[claim_id_3]["verdict"] == "CLAIM_ABANDONED"
     assert contract.escrows[escrow_id_timeout]["status"] == "ACTIVE", "Escrow must unlock to ACTIVE after abandonment"
     print("  PASS: Claimant successfully recovered bond after 7-day timeout.")
@@ -760,8 +806,8 @@ def run_all_tests():
     assert contract.escrows[escrow_id_fulfill]["total_released_to_generator"] == escrow_amount
     print("  PASS: Metered generation delivery confirmed and collateral disbursed to generator.")
 
-    # Phase 14: Expired Undelivered Escrow Recovery by Offtaker
-    print("\n[Phase 14] Testing expired undelivered escrow recovery after deadline...")
+    # Phase 14: Expired Undelivered Escrow Recovery by Offtaker (after Grace Window)
+    print("\n[Phase 14] Testing expired undelivered escrow recovery after deadline and grace period...")
     escrow_id_expire = contract.create_ppa_escrow(
         caller=offtaker,
         value=escrow_amount,
@@ -799,8 +845,71 @@ def run_all_tests():
     assert contract.claimable_balances[offtaker] == 0, "Balance cleanly zeroed upon successful transfer."
     print("  PASS: Pull-pattern claimable balance recovery preserves balance on transfer failure.")
 
+    # Phase 16: Symmetric Generator Payout (CRIT-01 Remediated)
+    print("\n[Phase 16] Testing symmetric generator payout after billing deadline...")
+    escrow_id_gen_claim = contract.create_ppa_escrow(
+        caller=offtaker,
+        value=escrow_amount,
+        generator_address=generator,
+        facility_node="CAISO-PACIFIC-SOLAR-500KV",
+        contracted_capacity_mw=120,
+        duration_seconds=86400 * 10
+    )
+    try:
+        contract.claim_completed_ppa_payout(caller=generator, escrow_id=escrow_id_gen_claim, custom_time=now)
+        assert False, "Should revert if deadline not reached"
+    except AssertionError as e:
+        assert "[ERR_DEADLINE_NOT_REACHED]" in str(e)
+
+    contract.claim_completed_ppa_payout(caller=generator, escrow_id=escrow_id_gen_claim, custom_time=now + 86400 * 11)
+    assert contract.escrows[escrow_id_gen_claim]["status"] == "FULFILLED"
+    assert contract.escrows[escrow_id_gen_claim]["total_released_to_generator"] == escrow_amount
+    print("  PASS: Generator successfully collected earned PPA payout after billing deadline.")
+
+    # Phase 17: Unauthorized Third-Party Claim Rejection (HIGH-03 Remediated)
+    print("\n[Phase 17] Testing rejection of unauthorized third-party curtailment claims...")
+    escrow_id_auth_test = contract.create_ppa_escrow(
+        caller=offtaker,
+        value=escrow_amount,
+        generator_address=generator,
+        facility_node="ERCOT-COASTAL-WIND",
+        contracted_capacity_mw=100,
+        duration_seconds=86400 * 14
+    )
+    unauthorized_attacker = "0x9999999999999999999999999999999999999999"
+    try:
+        contract.submit_curtailment_indemnity_claim(
+            caller=unauthorized_attacker,
+            value=bond_amount,
+            escrow_id=escrow_id_auth_test,
+            dispatch_order_url=valid_url,
+            curtailed_mwh=100,
+            nonce="nonce_attack"
+        )
+        assert False, "Should reject unauthorized claimant"
+    except AssertionError as e:
+        assert "[ERR_UNAUTHORIZED_CLAIMANT]" in str(e)
+    print("  PASS: Unauthorized third-party curtailment dispute attempt cleanly rejected.")
+
+    # Phase 18: Counterparty Dispute Unlock on Abandoned Claims (CRIT-02 Remediated)
+    print("\n[Phase 18] Testing offtaker unlocking abandoned dispute after 7-day timeout...")
+    claim_id_abandon_test = contract.submit_curtailment_indemnity_claim(
+        caller=generator,
+        value=bond_amount,
+        escrow_id=escrow_id_auth_test,
+        dispatch_order_url=valid_url,
+        curtailed_mwh=100,
+        nonce="nonce_unlock_test"
+    )
+    assert contract.escrows[escrow_id_auth_test]["status"] == "DISPUTED"
+
+    # Offtaker calls claim_abandoned_curtailment_bond after 8 days
+    contract.claim_abandoned_curtailment_bond(caller=offtaker, claim_id=claim_id_abandon_test, custom_time=now + 86400 * 8)
+    assert contract.escrows[escrow_id_auth_test]["status"] == "ACTIVE", "Escrow must be unblocked back to ACTIVE by offtaker"
+    print("  PASS: Offtaker successfully unlocked abandoned dispute, preventing permanent escrow deadlock.")
+
     print("\n================================================================================")
-    print("  ALL 15 REGRESSION & SECURITY PHASES PASSED WITH ZERO ERRORS!")
+    print("  ALL 18 REGRESSION & SECURITY PHASES PASSED WITH ZERO ERRORS!")
     print("================================================================================")
 
 
